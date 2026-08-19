@@ -29,7 +29,7 @@ if str(SRC_DIR) not in sys.path:
 
 import gradio as gr
 from pipeline import (
-    EMBEDDING_BACKEND,
+    EMBEDDING_MODEL,
     get_retriever,
     load_references,
     secure_generate_answer,
@@ -123,7 +123,7 @@ with gr.Blocks(title="Fibromyalgia Guarded RAG") as demo:
         "Ask questions grounded strictly in the review article: "
         "*'Fibromyalgia: A Review of the Pathophysiological Mechanisms and Multidisciplinary Treatment Strategies'*\n\n"
         f"**Generation mode:** {gen_status} | "
-        f"**Embedding backend:** {EMBEDDING_BACKEND}"
+        f"**Embedding model:** {EMBEDDING_MODEL}"
     )
 
     with gr.Row():

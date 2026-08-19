@@ -754,6 +754,7 @@ def retrieve_and_rerank(
                 "chunk_id": cid,
                 "source": doc.metadata.get("source"),
                 "section": doc.metadata.get("section"),
+                "subsection": doc.metadata.get("subsection"),
                 "pages": doc.metadata.get("page_numbers"),
                 "dense_score": merged[cid]["dense_score"],
                 "bm25_score": merged[cid]["bm25_score"],
@@ -847,6 +848,8 @@ def check_content_safety(text: str, max_retries: int = 3) -> dict:
             response = requests.post(LAKERA_GUARD_URL, json=payload, headers=headers, timeout=15)
             response.raise_for_status()
             data = response.json()
+            if "flagged" not in data:
+                return {"safe": False, "categories": ["safety_schema_error"], "raw": data, "error": "Unexpected Lakera API schema: 'flagged' missing"}
             flagged = bool(data.get("flagged", False))
             categories = [
                 item.get("detector_type", "unknown")
@@ -875,11 +878,13 @@ def check_grounding(answer: str, sources: list[dict], max_retries: int = 2) -> d
     section_pages = defaultdict(set)
     chunks_text = {}
     for s in sources:
-        sec = s.get("section")
-        if not sec: continue
-        for p in s.get("pages") or []:
-            section_pages[str(sec)].add(str(p))
-            chunks_text[f"Section {sec}, p. {p}"] = s.get("text", "")
+        for key in ["section", "subsection"]:
+            sec_full = s.get(key)
+            if not sec_full: continue
+            sec_num = str(sec_full).split(" ")[0]
+            for p in s.get("pages") or []:
+                section_pages[sec_num].add(str(p))
+                chunks_text[f"Section {sec_num}, p. {p}"] = s.get("text", "")
 
     def _expand_pages(pages_raw: str) -> set[str]:
         out = set()
@@ -896,7 +901,7 @@ def check_grounding(answer: str, sources: list[dict], max_retries: int = 2) -> d
         return out
 
     # Split into sentences/claims roughly
-    claims = [c.strip() for c in re.split(r'(?<=[.!?])\s+', answer) if len(c.strip()) > 10]
+    claims = [c.strip() for c in re.split(r'(?<!\bp\.)(?<!\bpp\.)(?<!\bSec\.)(?<!et al\.)(?<=[.!?])\s+', answer) if len(c.strip()) > 10]
     
     n_claims = len(claims)
     n_supported = 0
@@ -922,7 +927,7 @@ def check_grounding(answer: str, sources: list[dict], max_retries: int = 2) -> d
         claim_context = []
         claim_invalid = False
         for sec_raw, pages_raw in citations:
-            sec = sec_raw.strip()
+            sec = sec_raw.strip().split(" ")[0]
             cited_pages = _expand_pages(pages_raw)
             if sec not in section_pages or not (cited_pages <= section_pages[sec]):
                 claim_invalid = True
@@ -1101,8 +1106,9 @@ def format_context(results: list[dict], max_tokens: int = MAX_CONTEXT_TOKENS) ->
     parts, used, total_tokens = [], [], 0
     for i, r in enumerate(results, start=1):
         pages = ", ".join(str(p) for p in (r["pages"] or []))
+        sec_title = r.get("subsection") or r.get("section")
         piece = (
-            f"[{i}] (Source: {r['source']}, Section: {r['section']}, p. {pages})\n"
+            f"[{i}] (Source: {r['source']}, Section: {sec_title}, p. {pages})\n"
             f"{r['doc'].page_content}"
         )
         piece_tokens = token_len(piece)
@@ -1165,12 +1171,21 @@ def secure_generate_answer(
     guardrail_report["input_safety"] = input_safety
     if not input_safety["safe"]:
         guardrail_report["abstained"] = True
+        
+        if input_safety.get("error"):
+            ans_msg = "The system abstained from answering because the content-safety service is unavailable."
+            abstention_reason = "safety_service_unavailable"
+        else:
+            ans_msg = "Your question was withheld by the content-safety filter."
+            abstention_reason = "unsafe_content"
+
         result = {
             "question": question,
-            "answer": None,
+            "answer": ans_msg,
             "sources": [],
             "n_chunks_retrieved": 0,
             "guardrails": guardrail_report,
+            "abstention_reason": abstention_reason,
         }
         log_query({"timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(), "latency_s": round(time.time() - started_at, 3), **result})
         return result
@@ -1295,6 +1310,7 @@ def secure_generate_answer(
             "chunk_id": r["chunk_id"],
             "source": r["source"],
             "section": r["section"],
+            "subsection": r.get("subsection"),
             "pages": r["pages"],
             "text": r["doc"].page_content,
             "dense_score": r["dense_score"],
@@ -1344,12 +1360,21 @@ def secure_generate_answer(
     guardrail_report["output_safety"] = output_safety
     if not output_safety["safe"]:
         guardrail_report["abstained"] = True
+        
+        if output_safety.get("error"):
+            ans_msg = "The system abstained from answering because the content-safety service is unavailable."
+            abstention_reason = "safety_service_unavailable"
+        else:
+            ans_msg = "The generated answer was withheld by the content-safety filter."
+            abstention_reason = "unsafe_content"
+
         result = {
             "question": question,
-            "answer": "The generated answer was withheld by the content-safety filter.",
+            "answer": ans_msg,
             "sources": sources,
             "n_chunks_retrieved": len(results),
             "guardrails": guardrail_report,
+            "abstention_reason": abstention_reason,
         }
         log_query({"timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(), "latency_s": round(time.time() - started_at, 3), **result})
         return result
