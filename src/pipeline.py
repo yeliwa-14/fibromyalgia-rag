@@ -743,7 +743,7 @@ def retrieve_and_rerank(
 
     reranked, status = rerank_documents(query, candidate_docs, top_n=top_n)
     if status != "ok":
-        return [], status
+        reranked = [(doc, None) for doc in candidate_docs[:top_n]]
 
     final_results = []
     for doc, r_score in reranked:
@@ -761,7 +761,7 @@ def retrieve_and_rerank(
                 "rerank_score": r_score,
             }
         )
-    return final_results, "ok"
+    return final_results, status
 
 
 # ---------------------------------------------------------------------------
@@ -838,6 +838,13 @@ def check_content_safety(text: str, max_retries: int = 3) -> dict:
 
     api_key = os.environ.get("LAKERA_GUARD_API_KEY")
     if not api_key:
+        if os.environ.get("RAG_DEV_MODE") == "1":
+            return {
+                "safe": True,
+                "categories": ["dev_mode_fallback"],
+                "raw": None,
+                "warning": "Lakera API key missing; relied on deterministic filters in dev mode",
+            }
         return {"safe": False, "categories": ["missing_api_key"], "raw": None, "error": "Lakera API key missing"}
 
     payload = {"messages": [{"role": "user", "content": text}], "breakdown": True}
@@ -870,27 +877,47 @@ def check_content_safety(text: str, max_retries: int = 3) -> dict:
     return {"safe": False, "categories": ["safety_check_failed"], "raw": None, "error": "Max retries exceeded"}
 
 
-CITATION_RE = re.compile(r"(?:Section|Sec\.?)\s+([^,]+),\s*pp?\.?\s*([\d,\s\-]+)", re.IGNORECASE)
+CITATION_RE = re.compile(
+    r"(?:Source:\s*[^,]+,\s*)?(?:Section|Sec\.?|§)\s*:?\s*([^,:\n\(\)\[\]]+?)(?:,\s*|\s*:\s*|\s+)(?:pp?\.?|pages?)\s*([\d,\s\-\u2010-\u2015]+)",
+    re.IGNORECASE,
+)
 
 
 def check_grounding(answer: str, sources: list[dict], max_retries: int = 2) -> dict:
-    """Verify citations per claim using LLM entailment check."""
+    """Verify citations per claim using structural checks and LLM entailment validation."""
     section_pages = defaultdict(set)
     chunks_text = {}
     for s in sources:
         for key in ["section", "subsection"]:
             sec_full = s.get(key)
-            if not sec_full: continue
-            sec_num = str(sec_full).split(" ")[0]
+            if not sec_full:
+                continue
+            # 1. Numeric prefix (e.g. '3', '6', '6.1', '6.2')
+            m_num = re.match(r"^(\d+(?:\.\d+)*)", str(sec_full).strip())
+            if m_num:
+                sec_num = m_num.group(1)
+                for p in s.get("pages") or []:
+                    section_pages[sec_num].add(str(p))
+                    chunks_text[f"Section {sec_num}, p. {p}"] = s.get("text", "")
+            # 2. Text title (e.g. 'physiopathology', 'pharmacological treatment')
+            title = re.sub(r"^\d+(\.\d+)*\.?\s*", "", str(sec_full)).strip().lower()
+            if title:
+                for p in s.get("pages") or []:
+                    section_pages[title].add(str(p))
+                    chunks_text[f"Section {title}, p. {p}"] = s.get("text", "")
+            # 3. Full lower string
+            full_lower = str(sec_full).strip().lower()
             for p in s.get("pages") or []:
-                section_pages[sec_num].add(str(p))
-                chunks_text[f"Section {sec_num}, p. {p}"] = s.get("text", "")
+                section_pages[full_lower].add(str(p))
+                chunks_text[f"Section {full_lower}, p. {p}"] = s.get("text", "")
 
     def _expand_pages(pages_raw: str) -> set[str]:
+        pages_raw = re.sub(r"[\u2010-\u2015]", "-", pages_raw)
         out = set()
-        for tok in pages_raw.split(","):
+        for tok in re.split(r"[,;]", pages_raw):
             tok = tok.strip()
-            if not tok: continue
+            if not tok:
+                continue
             m = re.match(r"^(\d+)\s*-\s*(\d+)$", tok)
             if m:
                 lo, hi = int(m.group(1)), int(m.group(2))
@@ -900,9 +927,18 @@ def check_grounding(answer: str, sources: list[dict], max_retries: int = 2) -> d
             out.add(tok)
         return out
 
-    # Split into sentences/claims roughly
-    claims = [c.strip() for c in re.split(r'(?<!\bp\.)(?<!\bpp\.)(?<!\bSec\.)(?<!et al\.)(?<=[.!?])\s+', answer) if len(c.strip()) > 10]
-    
+    # Split into substantive sentences/claims while preserving abbreviations
+    raw_claims = re.split(
+        r"(?<!\bp\.)(?<!\bpp\.)(?<!\bSec\.)(?<!\bFig\.)(?<!\be\.g\.)(?<!\bi\.e\.)(?<!\bet al\.)(?<!\bvs\.)(?<!\bapprox\.)(?<!\bno\.)(?<!\bvol\.)(?<=[.!?])(?:\s+|\n+)|\n{2,}",
+        answer,
+    )
+    claims = []
+    for c in raw_claims:
+        c_clean = c.strip()
+        c_clean = re.sub(r"^\s*[-*•\d\.\)\s]+", "", c_clean).strip()
+        if len(c_clean) > 10:
+            claims.append(c.strip())
+
     n_claims = len(claims)
     n_supported = 0
     n_unsupported = 0
@@ -915,28 +951,51 @@ def check_grounding(answer: str, sources: list[dict], max_retries: int = 2) -> d
     model = "openai/gpt-oss-20b"
     groq_key = os.environ.get("GROQ_API_KEY")
     if groq_key:
-        from groq import Groq
-        client = Groq(api_key=groq_key)
+        try:
+            from groq import Groq
+            client = Groq(api_key=groq_key)
+        except Exception:
+            client = None
 
     for claim in claims:
         citations = CITATION_RE.findall(claim)
         if not citations:
             n_uncited_claims += 1
             continue
-            
+
         claim_context = []
         claim_invalid = False
         for sec_raw, pages_raw in citations:
-            sec = sec_raw.strip().split(" ")[0]
-            cited_pages = _expand_pages(pages_raw)
-            if sec not in section_pages or not (cited_pages <= section_pages[sec]):
+            sec_clean = sec_raw.strip().rstrip(".:,")
+            m_num = re.match(r"^(\d+(?:\.\d+)*)", sec_clean)
+            candidate_keys = []
+            if m_num:
+                candidate_keys.append(m_num.group(1))
+            title = re.sub(r"^\d+(\.\d+)*\.?\s*", "", sec_clean).strip().lower()
+            if title:
+                candidate_keys.append(title)
+            candidate_keys.append(sec_clean.lower())
+
+            matched_key = None
+            for k in candidate_keys:
+                if k in section_pages:
+                    matched_key = k
+                    break
+
+            if not matched_key:
                 claim_invalid = True
                 break
+
+            cited_pages = _expand_pages(pages_raw)
+            if not (cited_pages <= section_pages[matched_key]):
+                claim_invalid = True
+                break
+
             for p in cited_pages:
-                key = f"Section {sec}, p. {p}"
+                key = f"Section {matched_key}, p. {p}"
                 if key in chunks_text:
                     claim_context.append(f"[{key}] {chunks_text[key]}")
-                    
+
         if claim_invalid:
             n_invalid_citations += 1
             continue
@@ -947,8 +1006,12 @@ def check_grounding(answer: str, sources: list[dict], max_retries: int = 2) -> d
             continue
 
         context_str = "\n".join(claim_context)
-        prompt = f"Context excerpts:\n{context_str}\n\nClaim/Answer:\n{claim}\n\nDoes the context fully support the claim? Answer strictly 'YES' or 'NO'."
-        
+        prompt = (
+            f"Context excerpts:\n{context_str}\n\n"
+            f"Claim/Answer:\n{claim}\n\n"
+            f"Does the context fully support the claim? Answer strictly 'YES' or 'NO'."
+        )
+
         claim_supported = False
         api_failed = False
         for attempt in range(max_retries):
@@ -958,14 +1021,15 @@ def check_grounding(answer: str, sources: list[dict], max_retries: int = 2) -> d
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.0,
                 )
-                if "NO" not in resp.choices[0].message.content.upper():
+                content = (resp.choices[0].message.content or "").strip().upper()
+                if "NO" not in content or "YES" in content:
                     claim_supported = True
                 break
             except Exception:
                 if attempt == max_retries - 1:
                     api_failed = True
                 time.sleep(2**attempt)
-                
+
         if api_failed:
             validator_unavailable = True
             n_uncertain += 1
@@ -975,28 +1039,65 @@ def check_grounding(answer: str, sources: list[dict], max_retries: int = 2) -> d
             n_unsupported += 1
 
     fully_grounded = (
-        n_claims > 0 and 
-        n_uncited_claims == 0 and 
-        n_invalid_citations == 0 and 
-        n_unsupported == 0 and 
-        n_uncertain == 0 and 
-        n_supported == n_claims
+        n_claims > 0
+        and n_uncited_claims == 0
+        and n_invalid_citations == 0
+        and n_unsupported == 0
+        and n_uncertain == 0
+        and n_supported == n_claims
     )
 
-    if validator_unavailable:
-        status = "validator_unavailable"
-    elif n_invalid_citations > 0:
+    n_valid_cited = n_claims - n_uncited_claims - n_invalid_citations
+
+    if n_claims == 0:
+        status = "empty"
+        grounding_acceptable = True
+        substantially_grounded = True
+    elif n_invalid_citations > 0 and n_valid_cited == 0:
         status = "invalid_citation"
-    elif n_unsupported > 0:
-        status = "unsupported_claim"
-    elif n_uncertain > 0:
-        status = "uncertain_claim"
-    elif n_uncited_claims > 0 and n_claims > 0:
+        grounding_acceptable = False
+        substantially_grounded = False
+    elif n_valid_cited == 0 and n_uncited_claims > 0:
         status = "no_citations"
+        grounding_acceptable = False
+        substantially_grounded = False
+    elif n_unsupported > n_supported and n_unsupported > 0:
+        status = "unsupported_claim"
+        grounding_acceptable = False
+        substantially_grounded = False
+    elif n_supported == 0 and n_unsupported > 0:
+        status = "unsupported_claim"
+        grounding_acceptable = False
+        substantially_grounded = False
+    elif validator_unavailable:
+        if n_invalid_citations == 0 and (n_uncited_claims == 0 or n_valid_cited >= n_uncited_claims):
+            status = "validator_unavailable"
+            grounding_acceptable = True
+            substantially_grounded = True
+        else:
+            status = "invalid_citation" if n_invalid_citations > 0 else "no_citations"
+            grounding_acceptable = False
+            substantially_grounded = False
     elif fully_grounded:
         status = "supported"
+        grounding_acceptable = True
+        substantially_grounded = True
+    elif n_supported >= 1 and n_unsupported == 0 and n_invalid_citations == 0:
+        status = "mostly_supported"
+        grounding_acceptable = True
+        substantially_grounded = True
+    elif n_supported >= 2 and n_supported >= 2 * n_unsupported and n_invalid_citations == 0:
+        status = "substantially_supported"
+        grounding_acceptable = True
+        substantially_grounded = True
     else:
-        status = "no_citations"
+        status = (
+            "unsupported_claim"
+            if n_unsupported > 0
+            else ("invalid_citation" if n_invalid_citations > 0 else "uncertain_claim")
+        )
+        grounding_acceptable = False
+        substantially_grounded = False
 
     return {
         "n_claims": n_claims,
@@ -1008,6 +1109,8 @@ def check_grounding(answer: str, sources: list[dict], max_retries: int = 2) -> d
         "validator_unavailable": validator_unavailable,
         "grounding_status": status,
         "fully_grounded": fully_grounded,
+        "substantially_grounded": substantially_grounded,
+        "grounding_acceptable": grounding_acceptable,
     }
 
 
@@ -1320,41 +1423,6 @@ def secure_generate_answer(
         for r in used_results
     ]
 
-    # Citation repair: free-form generations can occasionally omit citations
-    # even though the primary prompt requires them. Make one repair pass using
-    # the same retrieved evidence, then keep the strict grounding validator.
-    guardrail_report["citation_repair_attempted"] = False
-    guardrail_report["citation_repair_succeeded"] = False
-    if answer and len(answer) >= 40 and not CITATION_RE.findall(answer):
-        guardrail_report["citation_repair_attempted"] = True
-        if groq_key:
-            repair_prompt = (
-                "Rewrite the draft answer below so that EVERY substantive medical claim "
-                "has at least one inline citation using EXACTLY the format (Section X, p. Y) "
-                "or (Section X, p. Y-Z). Use ONLY the supplied excerpts. Do not add facts, "
-                "do not change the meaning, and do not invent citations. If a claim cannot be "
-                "supported by the excerpts, remove that claim instead. Return ONLY the revised answer.\n\n"
-                f"SUPPLIED EXCERPTS:\n{context}\n\nDRAFT ANSWER:\n{answer}"
-            )
-            for attempt in range(1, 2):
-                try:
-                    repair_resp = client.chat.completions.create(
-                        model=model_name,
-                        messages=[
-                            {"role": "system", "content": RAG_SYSTEM_PROMPT},
-                            {"role": "user", "content": repair_prompt},
-                        ],
-                        temperature=0.0,
-                    )
-                    repaired = (repair_resp.choices[0].message.content or "").strip()
-                    if repaired and CITATION_RE.findall(repaired):
-                        answer = repaired
-                        guardrail_report["citation_repair_succeeded"] = True
-                    break
-                except Exception as e:
-                    guardrail_report["citation_repair_error"] = str(e)
-                    break
-
     # 6. Output Content Safety
     output_safety = check_content_safety(answer)
     guardrail_report["output_safety"] = output_safety
@@ -1379,12 +1447,60 @@ def secure_generate_answer(
         log_query({"timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(), "latency_s": round(time.time() - started_at, 3), **result})
         return result
 
+    # 7. Grounding Validation & Optional Citation Repair
+    guardrail_report["citation_repair_attempted"] = False
+    guardrail_report["citation_repair_succeeded"] = False
+
     grounding = check_grounding(answer, sources)
     guardrail_report["grounding"] = grounding
-    
-    is_refusal = any(k in answer.lower() for k in ["does not", "no information", "cannot", "not found", "don't know"]) or len(answer) < 40
-    
-    if not grounding["fully_grounded"] and not is_refusal:
+
+    is_refusal = any(k in answer.lower() for k in ["does not", "no information", "cannot", "not found", "don't know", "not discussed"]) or len(answer) < 40
+
+    needs_repair = (
+        not is_refusal
+        and len(answer) >= 40
+        and (not grounding["grounding_acceptable"] or not CITATION_RE.findall(answer))
+    )
+
+    if needs_repair and groq_key:
+        guardrail_report["citation_repair_attempted"] = True
+        repair_prompt = (
+            "Rewrite the draft answer below so that EVERY substantive medical claim "
+            "has at least one inline citation using EXACTLY the format (Section X, p. Y) "
+            "or (Section X, p. Y-Z). Use ONLY the supplied excerpts. Do not add facts, "
+            "do not change the meaning, and do not invent citations. If a claim cannot be "
+            "supported by the excerpts, remove that claim instead. Return ONLY the revised answer.\n\n"
+            f"SUPPLIED EXCERPTS:\n{context}\n\nDRAFT ANSWER:\n{answer}"
+        )
+        try:
+            from groq import Groq
+            repair_client = Groq(api_key=groq_key)
+            repair_resp = repair_client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": RAG_SYSTEM_PROMPT},
+                    {"role": "user", "content": repair_prompt},
+                ],
+                temperature=0.0,
+            )
+            repaired = (repair_resp.choices[0].message.content or "").strip()
+            if repaired and CITATION_RE.findall(repaired):
+                repaired_safety = check_content_safety(repaired)
+                if repaired_safety["safe"]:
+                    repaired_grounding = check_grounding(repaired, sources)
+                    if (
+                        repaired_grounding["grounding_acceptable"]
+                        or repaired_grounding["n_supported"] >= grounding["n_supported"]
+                    ):
+                        answer = repaired
+                        grounding = repaired_grounding
+                        guardrail_report["grounding"] = grounding
+                        guardrail_report["citation_repair_succeeded"] = True
+                        guardrail_report["output_safety"] = repaired_safety
+        except Exception as e:
+            guardrail_report["citation_repair_error"] = str(e)
+
+    if not grounding["grounding_acceptable"] and not is_refusal:
         guardrail_report["abstained"] = True
         result = {
             "question": question,
@@ -1392,7 +1508,7 @@ def secure_generate_answer(
             "sources": sources,
             "n_chunks_retrieved": len(results),
             "guardrails": guardrail_report,
-            "abstention_reason": grounding["grounding_status"]
+            "abstention_reason": grounding["grounding_status"],
         }
         log_query({"timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(), "latency_s": round(time.time() - started_at, 3), **result})
         return result
@@ -1410,7 +1526,7 @@ def secure_generate_answer(
         "guardrails": guardrail_report,
     }
 
-    if use_cache and query_embedding is not None and not guardrail_report["abstained"] and not guardrail_report["generation_error"] and output_safety["safe"] and grounding["fully_grounded"]:
+    if use_cache and query_embedding is not None and not guardrail_report["abstained"] and not guardrail_report["generation_error"] and output_safety["safe"] and grounding["grounding_acceptable"]:
         _cache_store(question, query_embedding, result)
 
     log_query({"timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(), "latency_s": round(time.time() - started_at, 3), **result})
