@@ -1304,6 +1304,41 @@ def secure_generate_answer(
         for r in used_results
     ]
 
+    # Citation repair: free-form generations can occasionally omit citations
+    # even though the primary prompt requires them. Make one repair pass using
+    # the same retrieved evidence, then keep the strict grounding validator.
+    guardrail_report["citation_repair_attempted"] = False
+    guardrail_report["citation_repair_succeeded"] = False
+    if answer and len(answer) >= 40 and not CITATION_RE.findall(answer):
+        guardrail_report["citation_repair_attempted"] = True
+        if groq_key:
+            repair_prompt = (
+                "Rewrite the draft answer below so that EVERY substantive medical claim "
+                "has at least one inline citation using EXACTLY the format (Section X, p. Y) "
+                "or (Section X, p. Y-Z). Use ONLY the supplied excerpts. Do not add facts, "
+                "do not change the meaning, and do not invent citations. If a claim cannot be "
+                "supported by the excerpts, remove that claim instead. Return ONLY the revised answer.\n\n"
+                f"SUPPLIED EXCERPTS:\n{context}\n\nDRAFT ANSWER:\n{answer}"
+            )
+            for attempt in range(1, 2):
+                try:
+                    repair_resp = client.chat.completions.create(
+                        model=model_name,
+                        messages=[
+                            {"role": "system", "content": RAG_SYSTEM_PROMPT},
+                            {"role": "user", "content": repair_prompt},
+                        ],
+                        temperature=0.0,
+                    )
+                    repaired = (repair_resp.choices[0].message.content or "").strip()
+                    if repaired and CITATION_RE.findall(repaired):
+                        answer = repaired
+                        guardrail_report["citation_repair_succeeded"] = True
+                    break
+                except Exception as e:
+                    guardrail_report["citation_repair_error"] = str(e)
+                    break
+
     # 6. Output Content Safety
     output_safety = check_content_safety(answer)
     guardrail_report["output_safety"] = output_safety
